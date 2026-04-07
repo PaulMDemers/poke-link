@@ -1,350 +1,433 @@
-# Trading Protocol Notes
+# Trading Protocol Reference
 
-This document describes the Generation 1 and Generation 2 trading flows as implemented by the current Arduino sketch in [`pk-ball/pk-ball.ino`](pk-ball/pk-ball.ino).
+This document describes the Generation 1 and Generation 2 trade protocol as implemented by the current Arduino sketch in [`pk-ball/pk-ball.ino`](pk-ball/pk-ball.ino).
 
-It is not intended to be a full reverse-engineering reference for the original games. It is a practical implementation note for this project: what the sketch listens for, what it sends, how it changes state, and where it decides which Pokemon to save.
+It is intentionally implementation-focused:
 
-## Shared Link Layer
+- which bytes the sketch reacts to
+- which state transitions matter
+- where party data lives in the incoming buffers
+- how the selected traded Pokemon is chosen and saved
 
-The sketch operates on the Game Boy link cable one byte at a time.
+It is not a complete reverse-engineering spec for the original games. It is a practical reference for maintaining this codebase.
 
-Pins used by the sketch:
+## Scope
 
-- `MOSI_` -> Arduino pin `8`
-- `MISO_` -> Arduino pin `9`
-- `SCLK_` -> Arduino pin `10`
+Current supported generations:
 
-Each received byte is processed by:
+- Generation 1
+- Generation 2
+
+Current sketch behavior:
+
+- emulates a trade partner over the Game Boy link cable
+- exposes one stored Pokemon per generation
+- captures the player's selected traded Pokemon
+- persists that Pokemon to EEPROM
+- restores the stored Pokemon on future boots
+
+## Shared Transport
+
+### Pins
+
+The sketch uses:
+
+| Signal | Arduino pin |
+| --- | --- |
+| `MOSI_` | `8` |
+| `MISO_` | `9` |
+| `SCLK_` | `10` |
+
+### Byte Processing Model
+
+The link is processed a bit at a time, but protocol decisions happen one byte at a time inside:
 
 - [`handleIncomingByte()`](pk-ball/pk-ball.ino)
 
-The sketch has two top-level connection phases:
+For each byte:
 
-- `NOT_CONNECTED`
-- `CONNECTED`
+1. The sketch receives one byte from the peer.
+2. It updates connection / trade state.
+3. It chooses one reply byte.
+4. It shifts that reply back out over the link.
 
-and then moves into:
+### Connection States
 
-- `TRADE_CENTRE`
-- `COLOSSEUM`
+Defined in [`pk-ball/pokemon.h`](pk-ball/pokemon.h):
 
-The trade logic in this project is built around the `TRADE_CENTRE` path.
+| State | Meaning |
+| --- | --- |
+| `NOT_CONNECTED` | Waiting for initial handshake |
+| `CONNECTED` | Link established, waiting for mode selection |
+| `TRADE_CENTRE` | In trade-center flow |
+| `COLOSSEUM` | In colosseum flow |
 
-## Shared Connection Handshake
+### Common Handshake Constants
 
-Important constants from [`pk-ball/pokemon.h`](pk-ball/pokemon.h):
+| Name | Value | Meaning |
+| --- | --- | --- |
+| `PKMN_MASTER` | `0x01` | Host/master token |
+| `PKMN_SLAVE` | `0x02` | Arduino/slave response |
+| `PKMN_BLANK` | `0x00` | Idle / blank |
+| `TRADE_CENTRE_WAIT` | `0xFD` | Trade wait marker |
+| `PKMN_BREAK_LINK` | `0xD6` | Disconnect / break |
 
-- `PKMN_MASTER = 0x01`
-- `PKMN_SLAVE = 0x02`
-- `PKMN_CONNECTED_I = 0x60`
-- `PKMN_CONNECTED_II = 0x61`
-- `PKMN_TRADE_CENTRE = 0xD4`
-- `GEN_II_CABLE_TRADE_CENTER = 0xD1`
-- `TRADE_CENTRE_WAIT = 0xFD`
+### Generation-Specific Entry Bytes
 
-Shared connection behavior:
+| Generation | Connected token | Trade center command | Colosseum command |
+| --- | --- | --- | --- |
+| Gen 1 | `0x60` | `0xD4` | `0xD5` |
+| Gen 2 | `0x61` | `0xD1` | `0xD2` |
 
-1. The Arduino waits for the host.
-2. If it sees `PKMN_MASTER`, it responds with `PKMN_SLAVE`.
-3. If it sees the generation-specific connected token, it enters `CONNECTED`.
-4. If it sees the generation-specific trade-center command, it enters `TRADE_CENTRE`.
+### Shared Trade State Machine
 
-## Shared Trade State Machine
+Defined in [`pk-ball/pokemon.h`](pk-ball/pokemon.h):
 
-The trade center state machine is defined in [`pk-ball/pokemon.h`](pk-ball/pokemon.h):
+| State | Purpose |
+| --- | --- |
+| `INIT` | Waiting for trade-center start |
+| `READY_TO_GO` | Link settled, waiting for first wait byte |
+| `SEEN_FIRST_WAIT` | First wait seen |
+| `SENDING_RANDOM_DATA` | Transitional pre-data chatter |
+| `WAITING_TO_SEND_DATA` | Waiting for the main block exchange to begin |
+| `SENDING_DATA` | Main player/trade block exchange |
+| `SENDING_PATCH_DATA` | Post-data patch / trailing exchange |
+| `MIMIC_SELECTION` | Gen 2-only post-data menu chatter |
+| `TRADE_PENDING` | Selection phase |
+| `TRADE_CONFIRMATION` | Confirmation phase |
+| `DONE` | Trade finished, waiting to settle back to idle |
 
-- `INIT`
-- `READY_TO_GO`
-- `SEEN_FIRST_WAIT`
-- `SENDING_RANDOM_DATA`
-- `WAITING_TO_SEND_DATA`
-- `SENDING_DATA`
-- `SENDING_PATCH_DATA`
-- `MIMIC_SELECTION`
-- `TRADE_PENDING`
-- `TRADE_CONFIRMATION`
-- `DONE`
+## Generation 1 Reference
 
-In practice, both generations follow this broad structure:
+### Core Constants
 
-1. Wait for the trade center to settle.
-2. Exchange the main player/trade block.
-3. Exchange a post-data phase.
-4. Enter selection.
-5. Confirm the trade.
-6. Save the traded Pokemon.
+| Item | Value |
+| --- | --- |
+| Connected token | `0x60` |
+| Trade center command | `0xD4` |
+| Main block length | `418` bytes |
+| Patch length | `197` bytes |
+| Input buffer | `gen1InputBlock[]` |
 
-The details differ between generations.
+### High-Level Flow
 
-## Data Blocks
+Gen 1 trade flow in this sketch:
 
-### Generation 1
+1. Enter `TRADE_CENTRE`
+2. Exchange the 418-byte main trade block
+3. Exchange 197 bytes of patch / trailing data
+4. Enter slot selection
+5. Confirm the trade
+6. Save the selected Pokemon to EEPROM
 
-Main trade block length:
+### State Progression
 
-- `GEN1_PLAYER_LENGTH = 418`
+Typical Gen 1 path:
 
-Patch length used by the sketch:
+```text
+INIT
+READY_TO_GO
+SEEN_FIRST_WAIT
+SENDING_RANDOM_DATA
+WAITING_TO_SEND_DATA
+SENDING_DATA
+SENDING_PATCH_DATA
+TRADE_PENDING
+TRADE_CONFIRMATION
+DONE
+INIT
+```
 
-- `GEN1_PATCH_LENGTH = 197`
-
-Incoming Gen 1 data is captured into:
-
-- `gen1InputBlock[]`
-
-Outgoing Gen 1 data is served from:
-
-- the Gen 1 EEPROM region via [`readGen1Data()`](pk-ball/pk-ball.ino)
-
-### Generation 2
-
-Main trade block length:
-
-- `GEN2_PLAYER_LENGTH = 444`
-
-Patch length used by the sketch:
-
-- `GEN2_PATCH_LENGTH = 197`
-
-Incoming Gen 2 data is captured into:
-
-- `gen2InputBlock[]`
-
-Outgoing Gen 2 data is served from:
-
-- the Gen 2 EEPROM region via [`readGen2Data()`](pk-ball/pk-ball.ino)
-
-## Generation 1 Protocol Outline
-
-### 1. Entering Trade Flow
-
-Gen 1 uses:
-
-- connected token: `0x60`
-- trade center command: `0xD4`
-
-Once inside `TRADE_CENTRE`, the sketch progresses through:
-
-- `INIT`
-- `READY_TO_GO`
-- `SEEN_FIRST_WAIT`
-- `SENDING_RANDOM_DATA`
-- `WAITING_TO_SEND_DATA`
-- `SENDING_DATA`
-
-### 2. Main Data Exchange
+### Main Data Exchange
 
 During `SENDING_DATA`:
 
-- the sketch sends bytes from the Gen 1 EEPROM payload
-- the incoming bytes are stored into `gen1InputBlock`
+- outgoing bytes come from [`readGen1Data()`](pk-ball/pk-ball.ino)
+- incoming bytes are copied into `gen1InputBlock`
 
-This continues until all `418` bytes have been exchanged.
+The full Gen 1 trade block is `418` bytes long.
 
-### 3. Patch Phase
+### Gen 1 Slot Bytes
 
-After the main block, Gen 1 enters `SENDING_PATCH_DATA`.
+The current sketch treats these as valid Gen 1 trade-slot bytes:
 
-In this implementation:
+| Byte | Slot index | Human slot |
+| --- | --- | --- |
+| `0x60` | `0` | Slot 1 |
+| `0x61` | `1` | Slot 2 |
+| `0x62` | `2` | Slot 3 |
+| `0x63` | `3` | Slot 4 |
+| `0x64` | `4` | Slot 5 |
+| `0x65` | `5` | Slot 6 |
+| `0x6F` | cancel | Back out |
 
-- the sketch mostly mirrors the incoming patch bytes back
-- after `197` patch bytes, it transitions to `TRADE_PENDING`
+The Arduino always answers with:
 
-### 4. Slot Selection
+| Meaning | Byte |
+| --- | --- |
+| Arduino-selected slot | `0x60` |
 
-Gen 1 slot-selection bytes are:
+So the Arduino side stays fixed on its first slot.
 
-- slot 1 -> `0x60`
-- slot 2 -> `0x61`
-- slot 3 -> `0x62`
-- slot 4 -> `0x63`
-- slot 5 -> `0x64`
-- slot 6 -> `0x65`
-- cancel -> `0x6F`
+### Gen 1 Save Rule
 
-In the current sketch:
+Important behavior:
 
-- valid Gen 1 trade slot bytes are detected by [`isValidTradeSlotByte()`](pk-ball/pk-ball.ino)
-- Gen 1 always responds with `0x60` from [`getFirstTradeSlotByte()`](pk-ball/pk-ball.ino)
+- the selected slot is first latched during the selection phase
+- the later confirmation byte is not trusted to override it if a slot is already latched
 
-That means the Arduino always offers the first slot on its own side, even while saving whichever slot the player selected from their party.
+This prevents the save from drifting to the wrong slot during confirmation.
 
-### 5. Confirmation
+### Gen 1 Data Layout
 
-Gen 1 then moves through:
+Within `gen1InputBlock`:
 
-- `TRADE_PENDING`
-- `TRADE_CONFIRMATION`
+| Section | Start | Size |
+| --- | --- | --- |
+| Party data | `19` | `44 * 6` |
+| OT names | `283` | `11 * 6` |
+| Nicknames | `349` | `11 * 6` |
 
-Important current behavior:
+Per-Pokemon record size:
 
-- the selected slot is first latched into `tradePokemon`
-- during Gen 1 confirmation, the sketch keeps that already-latched slot instead of trusting the later confirmation byte blindly
+| Field | Size |
+| --- | --- |
+| Party Pokemon record | `44` bytes |
+| OT name | `11` bytes |
+| Nickname | `11` bytes |
 
-This was an important bug fix, because the later confirmation byte in Gen 1 can differ from the original selected slot in a way that would otherwise shift saves to the wrong party member.
+Save offset formulas:
 
-### 6. Save Decision
+| Item | Formula |
+| --- | --- |
+| Party record | `19 + (slot * 44)` |
+| OT name | `283 + (slot * 11)` |
+| Nickname | `349 + (slot * 11)` |
 
-Gen 1 save logic lives in [`saveCompletedTrade()`](pk-ball/pk-ball.ino).
+### Gen 1 EEPROM Write Behavior
 
-It copies:
+When a Gen 1 trade is saved, the sketch writes:
 
-- the selected 44-byte party record
-- the species byte used in the visible party list
-- the matching OT name
-- the matching nickname
+- the selected 44-byte party record into the outgoing first-slot location
+- the selected species byte into the visible party list
+- the selected OT name
+- the selected nickname
 
-Offsets used by the sketch:
+This is what makes the traded Pokemon appear as the Arduino's offered Pokemon on the next boot.
 
-- party data starts at `19`
-- each party record is `44` bytes
-- OT names start at `283`
-- nicknames start at `349`
+## Generation 2 Reference
 
-Save slot formula:
+### Core Constants
 
-- `start = 19 + (savedTradeSlot * 44)`
+| Item | Value |
+| --- | --- |
+| Connected token | `0x61` |
+| Trade center command | `0xD1` |
+| Main block length | `444` bytes |
+| Patch length | `197` bytes |
+| Input buffer | `gen2InputBlock[]` |
 
-## Generation 2 Protocol Outline
+### High-Level Flow
 
-### 1. Entering Trade Flow
+Gen 2 trade flow in this sketch:
 
-Gen 2 uses:
+1. Enter `TRADE_CENTRE`
+2. Exchange the 444-byte main trade block
+3. Process post-data traffic
+4. Enter a Gen 2-specific selection handling phase
+5. Confirm the trade
+6. Save the selected Pokemon to EEPROM
 
-- connected token: `0x61`
-- trade center command: `0xD1`
+### State Progression
 
-The early shared state progression is the same:
+Typical Gen 2 path:
 
-- `INIT`
-- `READY_TO_GO`
-- `SEEN_FIRST_WAIT`
-- `SENDING_RANDOM_DATA`
-- `WAITING_TO_SEND_DATA`
-- `SENDING_DATA`
+```text
+INIT
+READY_TO_GO
+SEEN_FIRST_WAIT
+SENDING_RANDOM_DATA
+WAITING_TO_SEND_DATA
+SENDING_DATA
+SENDING_PATCH_DATA
+MIMIC_SELECTION
+TRADE_PENDING
+TRADE_CONFIRMATION
+DONE
+INIT
+```
 
-### 2. Main Data Exchange
+### Main Data Exchange
 
 During `SENDING_DATA`:
 
-- the sketch sends bytes from the Gen 2 EEPROM payload
-- the incoming bytes are stored into `gen2InputBlock`
+- outgoing bytes come from [`readGen2Data()`](pk-ball/pk-ball.ino)
+- incoming bytes are copied into `gen2InputBlock`
 
-This continues until all `444` bytes have been exchanged.
+The full Gen 2 trade block is `444` bytes long.
 
-### 3. Post-Data / Mimic Phase
+### Why `MIMIC_SELECTION` Exists
 
-After the main block, Gen 2 enters:
+Gen 2 has more post-data menu / selection chatter than Gen 1.
 
-- `SENDING_PATCH_DATA`
-- then `MIMIC_SELECTION`
+The sketch uses `MIMIC_SELECTION` as a buffer state to:
 
-`MIMIC_SELECTION` exists because the Gen 2 trade flow has extra chatter after the main data transfer before the real slot-selection bytes appear.
+- absorb that extra traffic
+- normalize some menu highlight / menu select bytes
+- wait until real trade-selection bytes appear
 
-During this phase, the sketch:
+This exists because treating the first post-data bytes as final slot decisions caused repeated slot-selection bugs.
 
-- mirrors or normalizes some menu/selection-related traffic
-- waits for real trade slot bytes or cancel
-- then transitions into `TRADE_PENDING`
+### Gen 2 Selection-Related Bytes
 
-### 4. Slot Selection
+Menu-related bytes seen by the sketch:
 
-In the current sketch implementation, valid Gen 2 slot bytes are treated as:
+| Name | Value |
+| --- | --- |
+| `ITEM_1_HIGHLIGHTED` | `0xD0` |
+| `ITEM_2_HIGHLIGHTED` | `0xD1` |
+| `ITEM_3_HIGHLIGHTED` | `0xD2` |
+| `ITEM_1_SELECTED` | `0xD4` |
+| `ITEM_2_SELECTED` | `0xD5` |
+| `ITEM_3_SELECTED` | `0xD6` |
 
-- `0x70` through `0x75`
-- cancel -> `0x6F`
+Trade-slot bytes used by the current sketch:
 
-The Arduino responds with:
+| Byte | Slot index | Human slot |
+| --- | --- | --- |
+| `0x70` | `0` | Slot 1 |
+| `0x71` | `1` | Slot 2 |
+| `0x72` | `2` | Slot 3 |
+| `0x73` | `3` | Slot 4 |
+| `0x74` | `4` | Slot 5 |
+| `0x75` | `5` | Slot 6 |
+| `0x6F` | cancel | Back out |
 
-- `0x70`
+The Arduino always answers with:
 
-so the Arduino side stays pinned to its own first slot.
+| Meaning | Byte |
+| --- | --- |
+| Arduino-selected slot | `0x70` |
 
-Internally, Gen 2 uses:
+So the Arduino side stays pinned to its own first slot.
 
-- `tradePokemon`
-- `confirmedTradePokemon`
-- `lastGen2TradeByte`
+### Gen 2 Confirmation Rule
 
-to track what the player selected and what was later confirmed.
+Gen 2 now has its own confirmation branch in the sketch.
 
-### 5. Confirmation
-
-Gen 2 then moves through:
-
-- `TRADE_PENDING`
-- `TRADE_CONFIRMATION`
-
-Unlike Gen 1, Gen 2 now has its own confirmation branch in the sketch so its behavior is isolated from Gen 1.
+That is important because Gen 1 and Gen 2 do not behave the same way during confirmation.
 
 Current Gen 2 confirmation behavior:
 
-- cancel resets the pending trade state
-- a valid confirmed slot byte updates `lastGen2TradeByte`
-- `confirmedTradePokemon` is set from that confirmed Gen 2 byte
-- `tradePokemon` is synced to `confirmedTradePokemon`
-- `pendingTradeSave` is set so the save happens reliably
+- valid confirmation bytes update `lastGen2TradeByte`
+- the confirmed slot is decoded from the Gen 2 confirmation byte
+- `confirmedTradePokemon` is set from that decoded slot
+- `pendingTradeSave` is set so the save occurs reliably
 
-### 6. Save Decision
+This logic is intentionally separated from the Gen 1 confirmation path to prevent cross-regressions.
 
-Gen 2 save logic also lives in [`saveCompletedTrade()`](pk-ball/pk-ball.ino).
+### Gen 2 Data Layout
 
-It copies:
+Within `gen2InputBlock`:
 
-- the selected 48-byte party record
-- the visible species byte in the outgoing block
-- the two party-header bytes at offsets `19` and `20`
-- the matching OT name
-- the matching nickname
+| Section | Start | Size |
+| --- | --- | --- |
+| Party data | `21` | `48 * 6` |
+| OT names | `309` | `11 * 6` |
+| Nicknames | `375` | `11 * 6` |
 
-Offsets used by the sketch:
+Additional bytes copied for the visible party header:
 
-- party data starts at `21`
-- each party record is `48` bytes
-- OT names start at `309`
-- nicknames start at `375`
+| Offset | Meaning |
+| --- | --- |
+| `12` | visible first-slot species |
+| `19` | Gen 2 header byte |
+| `20` | Gen 2 header byte |
 
-Save slot formula:
+Per-Pokemon record size:
 
-- `start = 21 + (savedTradeSlot * 48)`
+| Field | Size |
+| --- | --- |
+| Party Pokemon record | `48` bytes |
+| OT name | `11` bytes |
+| Nickname | `11` bytes |
 
-## EEPROM And Outgoing Party Data
+Save offset formulas:
 
-For both generations, outgoing trade data is always served from EEPROM, not directly from the last live incoming party buffer.
+| Item | Formula |
+| --- | --- |
+| Party record | `21 + (slot * 48)` |
+| OT name | `309 + (slot * 11)` |
+| Nickname | `375 + (slot * 11)` |
+
+### Gen 2 EEPROM Write Behavior
+
+When a Gen 2 trade is saved, the sketch writes:
+
+- the selected 48-byte party record into the outgoing first-slot location
+- the selected species byte into the visible party list
+- the two Gen 2 header bytes at offsets `19` and `20`
+- the selected OT name
+- the selected nickname
+
+## EEPROM Backing
+
+For both generations, outgoing trade data is always read from EEPROM, not from the last live incoming buffer.
 
 That means:
 
-- after a successful trade, the selected Pokemon is written into EEPROM
-- on the next boot, the sketch reads that stored Pokemon back out and offers it in future trades
+- the sketch captures a traded Pokemon from live traffic
+- it writes that Pokemon into the generation's EEPROM payload
+- future trades are served from EEPROM
 
-EEPROM validity is checked per generation using an 8-byte metadata footer:
+### EEPROM Region Layout
 
-- magic `PB`
-- metadata version
-- generation id
-- payload length
-- CRC-16 of the payload
+| Region | Payload range | Payload length | Footer range |
+| --- | --- | --- | --- |
+| Gen 1 | `0-417` | `418` bytes | `418-425` |
+| Gen 2 | `426-869` | `444` bytes | `870-877` |
 
-If a generation fails validation, the sketch reformats EEPROM and reseeds both trade blocks from the built-in default payloads.
+### EEPROM Footer Format
 
-## Important Implementation Notes
+Each generation ends with an 8-byte footer:
 
-### Generation 1
+| Offset in footer | Size | Meaning |
+| --- | --- | --- |
+| `0` | 1 | magic `P` |
+| `1` | 1 | magic `B` |
+| `2` | 1 | footer version |
+| `3` | 1 | generation id |
+| `4` | 1 | payload length low byte |
+| `5` | 1 | payload length high byte |
+| `6` | 1 | CRC-16 low byte |
+| `7` | 1 | CRC-16 high byte |
 
-The key Gen 1 lesson in this codebase is:
+### EEPROM Validation Rule
 
-- the selection-phase slot byte is the slot that should be saved
-- the later confirmation byte should not be allowed to shift the save slot if a slot is already latched
+At boot:
 
-### Generation 2
+1. Gen 1 footer is checked.
+2. Gen 2 footer is checked.
+3. Magic, version, generation, payload length, and CRC must all match.
+4. If either generation fails validation, EEPROM is reformatted and both regions are reseeded from the built-in defaults in [`pk-ball/output.h`](pk-ball/output.h).
 
-The key Gen 2 lesson in this codebase is:
+## Maintenance Notes
 
-- Gen 2 needs its own confirmation handling
-- Gen 2 includes extra post-data traffic before the final trade-selection flow settles
-- sharing too much of the confirmation logic with Gen 1 can cause regressions in either direction
+### Known Architectural Boundary
 
-## Useful Files
+The sketch still uses one shared state machine for both generations, but:
+
+- Gen 1 and Gen 2 share only the broad transport flow
+- selection and confirmation handling are generation-specific
+- save slot interpretation is generation-specific
+
+When changing trade behavior:
+
+- avoid re-sharing confirmation logic unless both generations are verified
+- test slot 1 through slot 6 for both generations
+- power-cycle between tests when debugging EEPROM behavior
+
+### Key Files
 
 - [`pk-ball/pk-ball.ino`](pk-ball/pk-ball.ino)
 - [`pk-ball/pokemon.h`](pk-ball/pokemon.h)
