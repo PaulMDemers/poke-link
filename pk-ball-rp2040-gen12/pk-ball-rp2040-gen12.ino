@@ -1,10 +1,12 @@
 #include <EEPROM.h>
 #include "pokemon.h"
 #include "output.h"
+#include "platform_storage.h"
 
-#define MOSI_ 8
-#define MISO_ 9
-#define SCLK_ 10
+#define MOSI_ 2
+#define MISO_ 1
+#define SCLK_ 0
+#define PSD_ 3
 
 #define FORCE_EEPROM_FORMAT_ON_BOOT 0
 #define DEBUG_EEPROM_DUMPS 0
@@ -14,13 +16,14 @@
 #define DEBUG_GEN1_SAVE_BLOCK 0
 #define DEBUG_GEN2_SELECTION_TRACE 1
 #define DEBUG_GEN2_SAVE_BLOCK 1
-#define DEFAULT_MODE MODE_GEN_1
+#define DEFAULT_MODE MODE_GEN_2
 #define REGION_METADATA_LENGTH 8
 #define REGION_METADATA_MAGIC_0 'P'
 #define REGION_METADATA_MAGIC_1 'B'
 #define REGION_METADATA_VERSION 1
 #define GEN1_REGION_SIZE (GEN1_PLAYER_LENGTH + REGION_METADATA_LENGTH)
 #define GEN2_REGION_SIZE (GEN2_PLAYER_LENGTH + REGION_METADATA_LENGTH)
+#define TOTAL_STORAGE_LENGTH (GEN1_REGION_SIZE + GEN2_REGION_SIZE)
 #define GEN1_EEPROM_BASE 0
 #define GEN2_EEPROM_BASE GEN1_REGION_SIZE
 
@@ -52,7 +55,6 @@ byte readOutgoingData(int index);
 byte readGen1Data(int index);
 byte readGen2Data(int index);
 void updateModeIfIdle(void);
-void resetTradeSession(void);
 bool hasValidRegionMetadata(int baseOffset, int payloadLength, byte generation);
 void writeRegionMetadata(int baseOffset, int payloadLength, byte generation);
 void formatEeprom(void);
@@ -78,10 +80,19 @@ void logRegionWrite(const char *label, int payloadLength, uint16_t crc);
 
 void setup() {
   Serial.begin(115200);
+  {
+    unsigned long serialStart = millis();
+    while (!Serial && (millis() - serialStart) < 3000UL) {
+    }
+  }
+  storageBegin(TOTAL_STORAGE_LENGTH);
+  Serial.print("pk-ball-rp2040-fresh boot\n");
+  Serial.print("serial baud=115200\n");
 
   pinMode(SCLK_, INPUT);
   pinMode(MISO_, INPUT);
   pinMode(MOSI_, OUTPUT);
+  pinMode(PSD_, INPUT);
 
   currentMode = DEFAULT_MODE;
 
@@ -200,15 +211,6 @@ byte handleIncomingByte(byte in) {
       }
       break;
 
-    case COLOSSEUM:
-      if (in == PKMN_BREAK_LINK || in == PKMN_MASTER) {
-        resetTradeSession();
-        send = PKMN_BREAK_LINK;
-      } else {
-        send = in;
-      }
-      break;
-
     case TRADE_CENTRE:
       if (currentMode == MODE_GEN_2 &&
           tradeCentreState >= MIMIC_SELECTION &&
@@ -314,23 +316,17 @@ byte handleIncomingByte(byte in) {
       } else if (currentMode == MODE_GEN_1 &&
                  tradeCentreState == TRADE_CONFIRMATION &&
                  (isTradeCancelByte(in) || isValidTradeSlotByte(in))) {
-        if (isTradeCancelByte(in)) {
-          send = 0x6F;
+        if (in == 0x61) {
+          send = in;
           tradePokemon = -1;
           confirmedTradePokemon = -1;
           pendingTradeSave = false;
           lastGen2TradeByte = 0x00;
           tradeCentreState = TRADE_PENDING;
         } else {
-          if (isValidTradeSlotByte(in)) {
-            confirmedTradePokemon = tradePokemon >= 0 ? tradePokemon : decodeTradeSlot(in);
-            tradePokemon = confirmedTradePokemon;
-            pendingTradeSave = true;
-          } else {
-            tradePokemon = decodeTradeSlot(in);
-            confirmedTradePokemon = tradePokemon;
-            pendingTradeSave = true;
-          }
+          confirmedTradePokemon = tradePokemon >= 0 ? tradePokemon : decodeTradeSlot(in);
+          tradePokemon = confirmedTradePokemon;
+          pendingTradeSave = true;
           send = getFirstTradeSlotByte();
           tradeCentreState = DONE;
         }
@@ -371,30 +367,7 @@ byte handleIncomingByte(byte in) {
 }
 
 void updateModeIfIdle(void) {
-  if (connectionState == NOT_CONNECTED &&
-      tradeCentreState == INIT &&
-      counter == 0 &&
-      tradePokemon < 0 &&
-      confirmedTradePokemon < 0 &&
-      !pendingTradeSave &&
-      lastGen2TradeByte == 0x00) {
-    return;
-  }
-
-#if DEBUG_LINK_TRACE
-  Serial.print("link reset after idle\n");
-#endif
-  resetTradeSession();
-}
-
-void resetTradeSession(void) {
-  connectionState = NOT_CONNECTED;
-  tradeCentreState = INIT;
-  counter = 0;
-  tradePokemon = -1;
-  confirmedTradePokemon = -1;
-  pendingTradeSave = false;
-  lastGen2TradeByte = 0x00;
+  return;
 }
 
 void ensureDefaultStorage(void) {
@@ -423,7 +396,7 @@ void initializeGen1Storage(void) {
   int i;
 
   for (i = 0; i < GEN1_PLAYER_LENGTH; i++) {
-    EEPROM.write(GEN1_EEPROM_BASE + i, pgm_read_byte(&(GEN1_DATA_BLOCK[i])));
+    storageWrite(GEN1_EEPROM_BASE + i, readDefaultDataByte(GEN1_DATA_BLOCK, i));
   }
 
   writeRegionMetadata(GEN1_EEPROM_BASE, GEN1_PLAYER_LENGTH, 1);
@@ -433,7 +406,7 @@ void initializeGen2Storage(void) {
   int i;
 
   for (i = 0; i < GEN2_PLAYER_LENGTH; i++) {
-    EEPROM.write(GEN2_EEPROM_BASE + i, pgm_read_byte(&(GEN2_DATA_BLOCK[i])));
+    storageWrite(GEN2_EEPROM_BASE + i, readDefaultDataByte(GEN2_DATA_BLOCK, i));
   }
 
   writeRegionMetadata(GEN2_EEPROM_BASE, GEN2_PLAYER_LENGTH, 2);
@@ -465,18 +438,18 @@ void saveCompletedTrade(void) {
     logGen1SavedBlock(savedTradeSlot, start);
 #endif
     for (i = 0; i < 44; i++) {
-      EEPROM.write(GEN1_EEPROM_BASE + 19 + i, gen1InputBlock[start + i]);
+      storageWrite(GEN1_EEPROM_BASE + 19 + i, gen1InputBlock[start + i]);
     }
-    EEPROM.write(GEN1_EEPROM_BASE + 12, gen1InputBlock[start]);
+    storageWrite(GEN1_EEPROM_BASE + 12, gen1InputBlock[start]);
 
     start = 283 + (savedTradeSlot * 11);
     for (i = 0; i < 11; i++) {
-      EEPROM.write(GEN1_EEPROM_BASE + 283 + i, gen1InputBlock[start + i]);
+      storageWrite(GEN1_EEPROM_BASE + 283 + i, gen1InputBlock[start + i]);
     }
 
     start = 349 + (savedTradeSlot * 11);
     for (i = 0; i < 11; i++) {
-      EEPROM.write(GEN1_EEPROM_BASE + 349 + i, gen1InputBlock[start + i]);
+      storageWrite(GEN1_EEPROM_BASE + 349 + i, gen1InputBlock[start + i]);
     }
 
     writeRegionMetadata(GEN1_EEPROM_BASE, GEN1_PLAYER_LENGTH, 1);
@@ -489,21 +462,21 @@ void saveCompletedTrade(void) {
     logGen2SavedBlock(savedTradeSlot, start);
 #endif
     for (i = 0; i < 48; i++) {
-      EEPROM.write(GEN2_EEPROM_BASE + 21 + i, gen2InputBlock[start + i]);
+      storageWrite(GEN2_EEPROM_BASE + 21 + i, gen2InputBlock[start + i]);
     }
 
-    EEPROM.write(GEN2_EEPROM_BASE + 12, gen2InputBlock[start]);
-    EEPROM.write(GEN2_EEPROM_BASE + 19, gen2InputBlock[19]);
-    EEPROM.write(GEN2_EEPROM_BASE + 20, gen2InputBlock[20]);
+    storageWrite(GEN2_EEPROM_BASE + 12, gen2InputBlock[start]);
+    storageWrite(GEN2_EEPROM_BASE + 19, gen2InputBlock[19]);
+    storageWrite(GEN2_EEPROM_BASE + 20, gen2InputBlock[20]);
 
     start = 309 + (savedTradeSlot * 11);
     for (i = 0; i < 11; i++) {
-      EEPROM.write(GEN2_EEPROM_BASE + 309 + i, gen2InputBlock[start + i]);
+      storageWrite(GEN2_EEPROM_BASE + 309 + i, gen2InputBlock[start + i]);
     }
 
     start = 375 + (savedTradeSlot * 11);
     for (i = 0; i < 11; i++) {
-      EEPROM.write(GEN2_EEPROM_BASE + 375 + i, gen2InputBlock[start + i]);
+      storageWrite(GEN2_EEPROM_BASE + 375 + i, gen2InputBlock[start + i]);
     }
 
     writeRegionMetadata(GEN2_EEPROM_BASE, GEN2_PLAYER_LENGTH, 2);
@@ -548,11 +521,11 @@ byte readOutgoingData(int index) {
 }
 
 byte readGen1Data(int index) {
-  return EEPROM.read(GEN1_EEPROM_BASE + index);
+  return storageRead(GEN1_EEPROM_BASE + index);
 }
 
 byte readGen2Data(int index) {
-  return EEPROM.read(GEN2_EEPROM_BASE + index);
+  return storageRead(GEN2_EEPROM_BASE + index);
 }
 
 int getPlayerLength(void) {
@@ -568,7 +541,7 @@ uint16_t computeRegionCrc(int baseOffset, int payloadLength) {
   uint16_t crc = 0xFFFF;
 
   for (i = 0; i < payloadLength; i++) {
-    crc ^= (uint16_t)EEPROM.read(baseOffset + i) << 8;
+    crc ^= (uint16_t)storageRead(baseOffset + i) << 8;
     for (byte bit = 0; bit < 8; bit++) {
       if (crc & 0x8000) {
         crc = (crc << 1) ^ 0x1021;
@@ -638,15 +611,15 @@ void logRegionWrite(const char *label, int payloadLength, uint16_t crc) {
 
 bool hasValidRegionMetadata(int baseOffset, int payloadLength, byte generation) {
   int metadataOffset = baseOffset + payloadLength;
-  uint16_t storedLength = (uint16_t)EEPROM.read(metadataOffset + 4) |
-                          ((uint16_t)EEPROM.read(metadataOffset + 5) << 8);
-  uint16_t storedCrc = (uint16_t)EEPROM.read(metadataOffset + 6) |
-                       ((uint16_t)EEPROM.read(metadataOffset + 7) << 8);
+  uint16_t storedLength = (uint16_t)storageRead(metadataOffset + 4) |
+                          ((uint16_t)storageRead(metadataOffset + 5) << 8);
+  uint16_t storedCrc = (uint16_t)storageRead(metadataOffset + 6) |
+                       ((uint16_t)storageRead(metadataOffset + 7) << 8);
   uint16_t computedCrc = computeRegionCrc(baseOffset, payloadLength);
-  bool valid = EEPROM.read(metadataOffset + 0) == REGION_METADATA_MAGIC_0 &&
-               EEPROM.read(metadataOffset + 1) == REGION_METADATA_MAGIC_1 &&
-               EEPROM.read(metadataOffset + 2) == REGION_METADATA_VERSION &&
-               EEPROM.read(metadataOffset + 3) == generation &&
+  bool valid = storageRead(metadataOffset + 0) == REGION_METADATA_MAGIC_0 &&
+               storageRead(metadataOffset + 1) == REGION_METADATA_MAGIC_1 &&
+               storageRead(metadataOffset + 2) == REGION_METADATA_VERSION &&
+               storageRead(metadataOffset + 3) == generation &&
                storedLength == payloadLength &&
                storedCrc == computedCrc;
 
@@ -661,14 +634,15 @@ void writeRegionMetadata(int baseOffset, int payloadLength, byte generation) {
   int metadataOffset = baseOffset + payloadLength;
   uint16_t crc = computeRegionCrc(baseOffset, payloadLength);
 
-  EEPROM.write(metadataOffset + 0, REGION_METADATA_MAGIC_0);
-  EEPROM.write(metadataOffset + 1, REGION_METADATA_MAGIC_1);
-  EEPROM.write(metadataOffset + 2, REGION_METADATA_VERSION);
-  EEPROM.write(metadataOffset + 3, generation);
-  EEPROM.write(metadataOffset + 4, payloadLength & 0xFF);
-  EEPROM.write(metadataOffset + 5, (payloadLength >> 8) & 0xFF);
-  EEPROM.write(metadataOffset + 6, crc & 0xFF);
-  EEPROM.write(metadataOffset + 7, (crc >> 8) & 0xFF);
+  storageWrite(metadataOffset + 0, REGION_METADATA_MAGIC_0);
+  storageWrite(metadataOffset + 1, REGION_METADATA_MAGIC_1);
+  storageWrite(metadataOffset + 2, REGION_METADATA_VERSION);
+  storageWrite(metadataOffset + 3, generation);
+  storageWrite(metadataOffset + 4, payloadLength & 0xFF);
+  storageWrite(metadataOffset + 5, (payloadLength >> 8) & 0xFF);
+  storageWrite(metadataOffset + 6, crc & 0xFF);
+  storageWrite(metadataOffset + 7, (crc >> 8) & 0xFF);
+  storageCommit();
 }
 
 void formatEeprom(void) {
@@ -677,12 +651,13 @@ void formatEeprom(void) {
 #if DEBUG_EEPROM_STATUS
   Serial.print("eeprom format begin\n");
 #endif
-  for (i = 0; i < EEPROM.length(); i++) {
-    EEPROM.write(i, 0x00);
+  for (i = 0; i < storageLength(); i++) {
+    storageWrite(i, 0x00);
   }
 
   initializeGen1Storage();
   initializeGen2Storage();
+  storageCommit();
 #if DEBUG_EEPROM_STATUS
   Serial.print("eeprom format complete\n");
 #endif
@@ -710,10 +685,10 @@ void dumpRange(const char *label, int start, int length) {
       Serial.print("\n");
     }
     Serial.print(" ");
-    if (EEPROM.read(start + i) < 0x10) {
+    if (storageRead(start + i) < 0x10) {
       Serial.print("0");
     }
-    Serial.print(EEPROM.read(start + i), HEX);
+    Serial.print(storageRead(start + i), HEX);
   }
 
   Serial.print("\n");
