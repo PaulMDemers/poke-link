@@ -216,3 +216,9 @@ Planned or likely future improvements:
 - add Gen 3 support and shared protocol helpers
 - separate reusable libraries from board-specific sketch code
 
+
+## References
+
+The original Arduino version of this script started life as a heavily modified version of these scripts:
+- [arduino-poke-gen2](https://github.com/stevenchaulk/arduino-poke-gen2)
+- [arduino-boy](https://github.com/pepijndevos/arduino-boy)
