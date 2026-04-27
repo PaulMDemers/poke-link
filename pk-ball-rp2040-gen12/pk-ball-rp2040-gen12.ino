@@ -16,7 +16,8 @@
 #define DEBUG_GEN1_SAVE_BLOCK 0
 #define DEBUG_GEN2_SELECTION_TRACE 1
 #define DEBUG_GEN2_SAVE_BLOCK 1
-#define DEFAULT_MODE MODE_GEN_2
+#define DEBUG_CAPTURE_INCOMING_PLAYER_BLOCK 0
+#define DEFAULT_MODE MODE_GEN_1
 #define REGION_METADATA_LENGTH 8
 #define REGION_METADATA_MAGIC_0 'P'
 #define REGION_METADATA_MAGIC_1 'B'
@@ -30,10 +31,11 @@
 #define GEN1_PATCH_LENGTH 197
 #define GEN2_PATCH_LENGTH 197
 
-operating_mode_t currentMode = DEFAULT_MODE;
+operating_mode_t currentMode = MODE_UNKNOWN;
 uint8_t shift = 0;
 uint8_t in_data = 0;
 uint8_t out_data = 0;
+bool pendingIncomingPlayerBlockDump = false;
 
 connection_state_t connectionState = NOT_CONNECTED;
 trade_centre_state_t tradeCentreState = INIT;
@@ -55,6 +57,9 @@ byte readOutgoingData(int index);
 byte readGen1Data(int index);
 byte readGen2Data(int index);
 void updateModeIfIdle(void);
+bool isModeDetected(void);
+const char *getModeLabel(void);
+void detectMode(operating_mode_t detectedMode, byte trigger);
 bool hasValidRegionMetadata(int baseOffset, int payloadLength, byte generation);
 void writeRegionMetadata(int baseOffset, int payloadLength, byte generation);
 void formatEeprom(void);
@@ -70,6 +75,8 @@ void logGen2SaveCandidates(void);
 void logGen2SavedBlock(int slot, int start);
 bool shouldLogGen1SelectionEvent(byte in);
 bool shouldLogGen2SelectionEvent(byte in);
+void dumpIncomingPlayerBlockIfPending(void);
+void dumpIncomingPlayerBlock(void);
 byte getFirstTradeSlotByte(void);
 int decodeTradeSlot(byte in);
 int getPlayerLength(void);
@@ -94,7 +101,7 @@ void setup() {
   pinMode(MOSI_, OUTPUT);
   pinMode(PSD_, INPUT);
 
-  currentMode = DEFAULT_MODE;
+  currentMode = MODE_UNKNOWN;
 
   ensureDefaultStorage();
 
@@ -103,7 +110,7 @@ void setup() {
 #endif
 
   Serial.print("mode ");
-  Serial.print(currentMode == MODE_GEN_1 ? "gen1" : "gen2");
+  Serial.print(getModeLabel());
   Serial.print("\n");
 
   digitalWrite(MOSI_, LOW);
@@ -121,6 +128,7 @@ void loop() {
       shift = 0;
       in_data = 0;
       saveCompletedTrade();
+      dumpIncomingPlayerBlockIfPending();
       updateModeIfIdle();
     }
   }
@@ -134,7 +142,7 @@ void transferBit(void) {
     shift = 0;
     out_data = handleIncomingByte(in_data);
 #if DEBUG_LINK_TRACE
-    Serial.print(currentMode == MODE_GEN_1 ? "g1 " : "g2 ");
+    Serial.print(isModeDetected() ? (currentMode == MODE_GEN_1 ? "g1 " : "g2 ") : "g? ");
     Serial.print(tradeCentreState);
     Serial.print(" ");
     Serial.print(connectionState);
@@ -177,7 +185,10 @@ void transferBit(void) {
 
 byte handleIncomingByte(byte in) {
   byte send = 0x00;
-  const byte connectedToken = currentMode == MODE_GEN_1 ? PKMN_CONNECTED_I : PKMN_CONNECTED_II;
+  const bool modeDetected = isModeDetected();
+  const byte connectedToken = currentMode == MODE_GEN_1 ? PKMN_CONNECTED_I :
+                              currentMode == MODE_GEN_2 ? PKMN_CONNECTED_II :
+                              0x00;
 
   switch (connectionState) {
     case NOT_CONNECTED:
@@ -185,13 +196,40 @@ byte handleIncomingByte(byte in) {
         send = PKMN_SLAVE;
       } else if (in == PKMN_BLANK) {
         send = PKMN_BLANK;
-      } else if (in == connectedToken) {
-        send = connectedToken;
+      } else if ((!modeDetected &&
+                  (in == PKMN_CONNECTED_I || in == PKMN_CONNECTED_II)) ||
+                 (modeDetected && in == connectedToken)) {
+        if (!modeDetected) {
+          detectMode(in == PKMN_CONNECTED_I ? MODE_GEN_1 : MODE_GEN_2, in);
+        }
+        send = in;
         connectionState = CONNECTED;
       }
       break;
 
     case CONNECTED:
+      if (!modeDetected) {
+        if (in == PKMN_CONNECTED_I || in == PKMN_CONNECTED_II) {
+          detectMode(in == PKMN_CONNECTED_I ? MODE_GEN_1 : MODE_GEN_2, in);
+          send = in;
+        } else if (in == PKMN_TRADE_CENTRE || in == PKMN_COLOSSEUM) {
+          detectMode(MODE_GEN_1, in);
+          connectionState = in == PKMN_TRADE_CENTRE ? TRADE_CENTRE : COLOSSEUM;
+          send = in;
+        } else if (in == GEN_II_CABLE_TRADE_CENTER || in == GEN_II_CABLE_CLUB_COLOSSEUM) {
+          detectMode(MODE_GEN_2, in);
+          connectionState = in == GEN_II_CABLE_TRADE_CENTER ? TRADE_CENTRE : COLOSSEUM;
+          send = in;
+        } else if (in == PKMN_BREAK_LINK || in == PKMN_MASTER) {
+          connectionState = NOT_CONNECTED;
+          tradeCentreState = INIT;
+          send = PKMN_BREAK_LINK;
+        } else {
+          send = in;
+        }
+        break;
+      }
+
       if (in == connectedToken) {
         send = connectedToken;
       } else if ((currentMode == MODE_GEN_1 && in == PKMN_TRADE_CENTRE) ||
@@ -256,6 +294,7 @@ byte handleIncomingByte(byte in) {
         }
         counter++;
         if (counter == getPlayerLength()) {
+          pendingIncomingPlayerBlockDump = true;
           tradeCentreState = SENDING_PATCH_DATA;
         }
       } else if (tradeCentreState == SENDING_PATCH_DATA && in == TRADE_CENTRE_WAIT) {
@@ -368,6 +407,90 @@ byte handleIncomingByte(byte in) {
 
 void updateModeIfIdle(void) {
   return;
+}
+
+void dumpIncomingPlayerBlockIfPending(void) {
+#if DEBUG_CAPTURE_INCOMING_PLAYER_BLOCK
+  if (pendingIncomingPlayerBlockDump) {
+    dumpIncomingPlayerBlock();
+    pendingIncomingPlayerBlockDump = false;
+  }
+#endif
+}
+
+void dumpIncomingPlayerBlock(void) {
+  const uint8_t *block = currentMode == MODE_GEN_1 ? gen1InputBlock : gen2InputBlock;
+  const int length = getPlayerLength();
+  const char *blockName = currentMode == MODE_GEN_1 ? "GEN1_DATA_BLOCK" : "GEN2_DATA_BLOCK";
+  int i;
+
+  Serial.print("CAPTURED ");
+  Serial.print(getModeLabel());
+  Serial.print(" player block begin\n");
+  Serial.print("const uint8_t ");
+  Serial.print(blockName);
+  Serial.print("[");
+  Serial.print(length);
+  Serial.print("] PROGMEM = {\n");
+
+  for (i = 0; i < length; i++) {
+    if ((i % 16) == 0) {
+      Serial.print("  ");
+    }
+
+    Serial.print("0x");
+    if (block[i] < 0x10) {
+      Serial.print("0");
+    }
+    Serial.print(block[i], HEX);
+
+    if (i != (length - 1)) {
+      Serial.print(", ");
+    }
+
+    if ((i % 16) == 15 || i == (length - 1)) {
+      Serial.print("\n");
+    }
+  }
+
+  Serial.print("};\n");
+  Serial.print("CAPTURED ");
+  Serial.print(getModeLabel());
+  Serial.print(" player block end\n");
+}
+
+bool isModeDetected(void) {
+  return currentMode == MODE_GEN_1 || currentMode == MODE_GEN_2;
+}
+
+const char *getModeLabel(void) {
+  if (currentMode == MODE_GEN_1) {
+    return "gen1";
+  }
+  if (currentMode == MODE_GEN_2) {
+    return "gen2";
+  }
+  return "unknown";
+}
+
+void detectMode(operating_mode_t detectedMode, byte trigger) {
+  if (detectedMode != MODE_GEN_1 && detectedMode != MODE_GEN_2) {
+    return;
+  }
+
+  if (currentMode == detectedMode) {
+    return;
+  }
+
+  currentMode = detectedMode;
+  Serial.print("mode detected ");
+  Serial.print(getModeLabel());
+  Serial.print(" trigger=");
+  if (trigger < 0x10) {
+    Serial.print("0");
+  }
+  Serial.print(trigger, HEX);
+  Serial.print("\n");
 }
 
 void ensureDefaultStorage(void) {

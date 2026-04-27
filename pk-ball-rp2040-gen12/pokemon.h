@@ -4,6 +4,7 @@
 typedef unsigned char byte;
 
 typedef enum {
+  MODE_UNKNOWN,
   MODE_GEN_1,
   MODE_GEN_2
 } operating_mode_t;
